@@ -1,9 +1,15 @@
 """
 SQL compilation for Cloudflare D1 dialect.
+
+Inherits from SQLite compilers to get proper SQLite SQL generation,
+including support for INSERT ... ON CONFLICT DO UPDATE (upsert).
 """
 
-from sqlalchemy.sql import compiler
-from sqlalchemy import schema
+from sqlalchemy.dialects.sqlite.base import (
+    SQLiteCompiler,
+    SQLiteDDLCompiler,
+    SQLiteTypeCompiler,
+)
 from sqlalchemy.sql.sqltypes import (
     String,
     Integer,
@@ -13,8 +19,12 @@ from sqlalchemy.sql.sqltypes import (
 )
 
 
-class CloudflareD1Compiler(compiler.SQLCompiler):
-    """SQL compiler for Cloudflare D1 (SQLite-based)."""
+class CloudflareD1Compiler(SQLiteCompiler):
+    """SQL compiler for Cloudflare D1 (SQLite-based).
+
+    Inherits from SQLiteCompiler to get proper SQLite SQL generation,
+    including ON CONFLICT DO UPDATE support for upserts.
+    """
 
     def limit_clause(self, select, **kw):
         """Handle LIMIT clause for SQLite."""
@@ -108,66 +118,90 @@ class CloudflareD1Compiler(compiler.SQLCompiler):
         raise NotImplementedError("REGEXP_REPLACE not supported in SQLite/D1")
 
 
-class CloudflareD1DDLCompiler(compiler.DDLCompiler):
-    """DDL compiler for Cloudflare D1."""
+class CloudflareD1DDLCompiler(SQLiteDDLCompiler):
+    """DDL compiler for Cloudflare D1.
 
-    def visit_create_table(self, create, **kw):
-        """Handle CREATE TABLE statements."""
-        # Use the base implementation but ensure SQLite compatibility
-        table = create.element
-        preparer = self.preparer
+    Inherits from SQLiteDDLCompiler to get proper SQLite DDL generation.
+    Overrides get_column_specification to never add AUTOINCREMENT since
+    D1 only supports it on INTEGER PRIMARY KEY, not TEXT PRIMARY KEY.
+    """
 
-        text = "\nCREATE "
-        if create.if_not_exists:
-            text += "TABLE IF NOT EXISTS "
-        else:
-            text += "TABLE "
+    def get_column_specification(self, column, first_pk=False, **kwargs):
+        """Get column specification for CREATE TABLE.
 
-        text += preparer.format_table(table)
-        text += " ("
+        Overrides SQLite's implementation to never add AUTOINCREMENT,
+        since D1 only supports AUTOINCREMENT on INTEGER PRIMARY KEY columns.
 
-        # Column definitions
-        separator = "\n"
-        for column in table.columns:
-            text += separator
-            text += "\t" + self.get_column_specification(column, **kw)
-            separator = ", \n"
-
-        # Constraints
-        for constraint in table.constraints:
-            if constraint.name is not None or not isinstance(
-                constraint, schema.PrimaryKeyConstraint
-            ):
-                text += separator
-                text += "\t" + self.process(constraint, **kw)
-                separator = ", \n"
-
-        text += "\n)"
-        return text
-
-    def get_column_specification(self, column, **kw):
-        """Get column specification for CREATE TABLE."""
-        colspec = self.preparer.format_column(column)
-        colspec += " " + self.dialect.type_compiler.process(
+        Args:
+            column: The column to generate specification for
+            first_pk: If True and column is primary key, include PRIMARY KEY
+                     inline (prevents duplicate constraint)
+        """
+        coltype = self.dialect.type_compiler_instance.process(
             column.type, type_expression=column
         )
+        colspec = self.preparer.format_column(column) + " " + coltype
 
-        # Handle primary key
-        if column.primary_key:
-            if column.autoincrement:
-                colspec += " PRIMARY KEY AUTOINCREMENT"
-            else:
-                colspec += " PRIMARY KEY"
+        default = self.get_column_default_string(column)
+        if default is not None:
+            colspec += f" DEFAULT {default}"
 
-        # Handle nullable
         if not column.nullable:
             colspec += " NOT NULL"
 
-        # Handle default
-        if column.default is not None:
-            colspec += " DEFAULT " + self.process(column.default.arg, **kw)
+        # Only add PRIMARY KEY inline if first_pk=True
+        # This prevents duplicate PRIMARY KEY constraints
+        # (one inline, one as separate constraint)
+        if column.primary_key and first_pk:
+            colspec += " PRIMARY KEY"
+
+        if column.computed is not None:
+            colspec += " " + self.process(column.computed)
 
         return colspec
+
+    def create_table_constraints(
+        self, table, _include_foreign_key_constraints=None, **kw
+    ):
+        """Create table constraints, skipping PK if it was added inline.
+
+        For single-column primary keys, we add PRIMARY KEY inline in
+        get_column_specification to avoid duplicate constraints.
+        """
+        constraints = []
+
+        # Only add PK constraint if it's a composite key (multiple columns)
+        # Single-column PKs are added inline in get_column_specification
+        if table.primary_key and len(table.primary_key.columns) > 1:
+            constraints.append(table.primary_key)
+
+        all_fkcs = table.foreign_key_constraints
+        if _include_foreign_key_constraints is not None:
+            omit_fkcs = all_fkcs.difference(_include_foreign_key_constraints)
+        else:
+            omit_fkcs = set()
+
+        constraints.extend(
+            [
+                c
+                for c in table._sorted_constraints
+                if c is not table.primary_key and c not in omit_fkcs
+            ]
+        )
+
+        return ", \n\t".join(
+            p
+            for p in (
+                self.process(constraint)
+                for constraint in constraints
+                if (constraint._should_create_for_compiler(self))
+                and (
+                    not self.dialect.supports_alter
+                    or not getattr(constraint, "use_alter", False)
+                )
+            )
+            if p is not None
+        )
 
     def visit_drop_table(self, drop, **kw):
         """Handle DROP TABLE statements."""
@@ -208,8 +242,11 @@ class CloudflareD1DDLCompiler(compiler.DDLCompiler):
         return text
 
 
-class CloudflareD1TypeCompiler(compiler.GenericTypeCompiler):
-    """Type compiler for Cloudflare D1."""
+class CloudflareD1TypeCompiler(SQLiteTypeCompiler):
+    """Type compiler for Cloudflare D1.
+
+    Inherits from SQLiteTypeCompiler to get proper SQLite type compilation.
+    """
 
     def visit_TEXT(self, type_, **kw):
         """Handle TEXT type."""
