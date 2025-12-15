@@ -13,6 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 
+## [0.3.0]
+
+### Changed
+
+- Refactored compilers to inherit from SQLite base classes (`SQLiteCompiler`, `SQLiteDDLCompiler`, `SQLiteTypeCompiler`) instead of generic SQLAlchemy compilers for better SQLite compatibility
+
+### Added
+
+- Support for `INSERT ... ON CONFLICT DO UPDATE` (upsert operations) via SQLite dialect inheritance
+- New unit tests for upsert compilation, DDL generation, and compiler inheritance
+
+### Fixed
+
+- Fixed duplicate PRIMARY KEY constraint in CREATE TABLE statements (was generating both inline and separate constraint)
+- Fixed AUTOINCREMENT being incorrectly added to non-INTEGER PRIMARY KEY columns (D1 only supports AUTOINCREMENT on INTEGER PRIMARY KEY)
+
+
 ## [0.2.0]
 
 ### Added

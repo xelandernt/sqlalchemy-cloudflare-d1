@@ -70,5 +70,111 @@ def test_compiler_classes():
     assert isinstance(dialect.type_compiler, CloudflareD1TypeCompiler)
 
 
+def test_on_conflict_do_update_compilation():
+    """Test that ON CONFLICT DO UPDATE (upsert) compiles correctly.
+
+    This verifies that the dialect inherits SQLite's upsert support.
+    """
+    from sqlalchemy import Column, Integer, MetaData, String, Table
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    dialect = CloudflareD1Dialect()
+    metadata = MetaData()
+
+    # Define a simple table
+    test_table = Table(
+        "test_table",
+        metadata,
+        Column("id", String, primary_key=True),
+        Column("name", String),
+        Column("value", Integer),
+    )
+
+    # Create an upsert statement
+    stmt = sqlite_insert(test_table).values([{"id": "1", "name": "test", "value": 100}])
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["id"],
+        set_={"name": stmt.excluded.name, "value": stmt.excluded.value},
+    )
+
+    # Compile the statement - this should NOT raise an error
+    compiled = stmt.compile(dialect=dialect)
+    sql = str(compiled)
+
+    # Verify the SQL contains the ON CONFLICT clause
+    assert "INSERT" in sql.upper()
+    assert "ON CONFLICT" in sql.upper()
+    assert "DO UPDATE SET" in sql.upper()
+
+
+def test_sqlite_compiler_inheritance():
+    """Test that compilers inherit from SQLite base classes."""
+    from sqlalchemy.dialects.sqlite.base import (
+        SQLiteCompiler,
+        SQLiteDDLCompiler,
+        SQLiteTypeCompiler,
+    )
+    from sqlalchemy_cloudflare_d1.compiler import (
+        CloudflareD1Compiler,
+        CloudflareD1DDLCompiler,
+        CloudflareD1TypeCompiler,
+    )
+
+    assert issubclass(CloudflareD1Compiler, SQLiteCompiler)
+    assert issubclass(CloudflareD1DDLCompiler, SQLiteDDLCompiler)
+    assert issubclass(CloudflareD1TypeCompiler, SQLiteTypeCompiler)
+
+
+def test_create_table_no_duplicate_primary_key():
+    """Test that CREATE TABLE doesn't have duplicate PRIMARY KEY constraints."""
+    from sqlalchemy import Column, MetaData, String, Table
+    from sqlalchemy.schema import CreateTable
+
+    dialect = CloudflareD1Dialect()
+    metadata = MetaData()
+
+    # Define a table with TEXT primary key (like langchain-cloudflare uses)
+    test_table = Table(
+        "test_table",
+        metadata,
+        Column("id", String, primary_key=True),
+        Column("text", String),
+        Column("namespace", String),
+        Column("metadata", String),
+    )
+
+    # Compile the CREATE TABLE statement
+    create_stmt = CreateTable(test_table)
+    compiled = create_stmt.compile(dialect=dialect)
+    sql = str(compiled)
+
+    # Count occurrences of "PRIMARY KEY" - should be exactly 1
+    pk_count = sql.upper().count("PRIMARY KEY")
+    assert pk_count == 1, f"Expected 1 PRIMARY KEY, found {pk_count} in: {sql}"
+
+
+def test_create_table_no_autoincrement_on_text():
+    """Test that CREATE TABLE doesn't add AUTOINCREMENT on TEXT columns."""
+    from sqlalchemy import Column, MetaData, String, Table
+    from sqlalchemy.schema import CreateTable
+
+    dialect = CloudflareD1Dialect()
+    metadata = MetaData()
+
+    test_table = Table(
+        "test_table",
+        metadata,
+        Column("id", String, primary_key=True),
+        Column("name", String),
+    )
+
+    create_stmt = CreateTable(test_table)
+    compiled = create_stmt.compile(dialect=dialect)
+    sql = str(compiled)
+
+    # Should NOT contain AUTOINCREMENT
+    assert "AUTOINCREMENT" not in sql.upper(), f"Unexpected AUTOINCREMENT in: {sql}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
