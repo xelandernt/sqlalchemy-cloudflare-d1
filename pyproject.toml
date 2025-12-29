@@ -84,6 +84,7 @@ addopts = "--ignore=tests/integration"
 dev = [
     "codespell>=2.4.1",
     "mypy>=1.17.0",
+    "pre-commit>=4.3.0",
     "pytest>=8.4.1",
     "pytest-asyncio>=0.21.0",
     "pytest-socket>=0.7.0",

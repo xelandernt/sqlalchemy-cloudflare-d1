@@ -210,6 +210,19 @@ class CloudflareD1Dialect(default.DefaultDialect):
         """D1 doesn't support isolation levels."""
         pass
 
+    def do_execute(
+        self, cursor: Any, statement: str, parameters: Any, context: Any = None
+    ) -> None:
+        if context and hasattr(context, "compiled"):
+            compiled = context.compiled
+            if hasattr(context, "statement"):
+                stmt = compiled.statement
+                if hasattr(stmt, "selected_columns"):
+                    column_names = [col.key for col in stmt.selected_columns]
+                    cursor._expected_columns = column_names
+
+        cursor.execute(statement, parameters)
+
     def get_table_names(
         self, connection: Any, schema: Optional[str] = None, **kw: Any
     ) -> List[str]:

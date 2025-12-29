@@ -147,6 +147,7 @@ class Cursor:
         self._closed = False
         self._position = 0
         self._last_result_meta = {}
+        self._expected_columns = None
 
     def execute(
         self, operation: str, parameters: Optional[Sequence] = None
@@ -178,14 +179,18 @@ class Cursor:
                         for name in first_row.keys()
                     ]
                 else:
-                    # Even if no results, we need to indicate this was a SELECT-like query
-                    # We can't know the column names without results, so we'll set an empty description
-                    # that still indicates this is a row-returning statement
-                    self._description = []
+                    if self._expected_columns:
+                        self._description = [
+                            (name, None, None, None, None, None, None)
+                            for name in self._expected_columns
+                        ]
+                    else:
+                        self._description = []
             else:
                 # For non-SELECT statements (INSERT, UPDATE, DELETE, etc.), description should be None
                 self._description = None
 
+            self._expected_columns = None
             self._position = 0
             return self
 
@@ -576,6 +581,7 @@ class WorkerCursor:
         self._closed = False
         self._position = 0
         self._last_result_meta: Dict[str, Any] = {}
+        self._expected_columns = None
 
     def execute(
         self, operation: str, parameters: Optional[Sequence] = None
@@ -613,10 +619,17 @@ class WorkerCursor:
                         for name in first_row.keys()
                     ]
                 else:
-                    self._description = []
+                    if self._expected_columns:
+                        self._description = [
+                            (name, None, None, None, None, None, None)
+                            for name in self._expected_columns
+                        ]
+                    else:
+                        self._description = []
             else:
                 self._description = None
 
+            self._expected_columns = None
             self._position = 0
             return self
 
@@ -908,6 +921,7 @@ class AsyncCursor:
         self._closed = False
         self._position = 0
         self._last_result_meta: Dict[str, Any] = {}
+        self._expected_columns = None
 
     async def __aenter__(self) -> "AsyncCursor":
         """Async context manager entry."""
@@ -945,10 +959,17 @@ class AsyncCursor:
                         for name in first_row.keys()
                     ]
                 else:
-                    self._description = []
+                    if self._expected_columns:
+                        self._description = [
+                            (name, None, None, None, None, None, None)
+                            for name in self._expected_columns
+                        ]
+                    else:
+                        self._description = []
             else:
                 self._description = None
 
+            self._expected_columns = None
             self._position = 0
             return self
 
@@ -1242,6 +1263,7 @@ class SyncWorkerCursor:
         self._closed = False
         self._position = 0
         self._last_result_meta: Dict[str, Any] = {}
+        self._expected_columns = None
 
     def execute(
         self, operation: str, parameters: Optional[Sequence] = None
@@ -1271,10 +1293,17 @@ class SyncWorkerCursor:
                         for name in first_row.keys()
                     ]
                 else:
-                    self._description = []
+                    if self._expected_columns:
+                        self._description = [
+                            (name, None, None, None, None, None, None)
+                            for name in self._expected_columns
+                        ]
+                    else:
+                        self._description = []
             else:
                 self._description = None
 
+            self._expected_columns = None
             self._position = 0
             return self
 
