@@ -2,7 +2,7 @@
 SQLAlchemy dialect for Cloudflare D1.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 from sqlalchemy.engine import default
 from sqlalchemy.sql.sqltypes import (
@@ -10,8 +10,9 @@ from sqlalchemy.sql.sqltypes import (
     NUMERIC,
     REAL,
     TEXT,
+    Boolean,
 )
-from sqlalchemy import text
+from sqlalchemy import text, Dialect
 
 from .connection import CloudflareD1DBAPI
 from .compiler import (
@@ -19,6 +20,29 @@ from .compiler import (
     CloudflareD1DDLCompiler,
     CloudflareD1TypeCompiler,
 )
+
+
+class D1Boolean(Boolean):
+    def result_processor(self, dialect: Dialect, coltype: object) -> Callable:
+        def process(value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                if value.lower() == "true":
+                    return True
+                elif value.lower() == "false":
+                    return False
+                elif value == "1":
+                    return True
+                elif value == "0":
+                    return False
+            elif isinstance(value, int):
+                return bool(value)
+            elif isinstance(value, bool):
+                return value
+            return value
+
+        return process
 
 
 class CloudflareD1Dialect(default.DefaultDialect):
@@ -53,6 +77,7 @@ class CloudflareD1Dialect(default.DefaultDialect):
     # Type mapping from SQLAlchemy to D1/SQLite
     colspecs = {
         # Map SQLAlchemy types to D1/SQLite equivalents
+        Boolean: D1Boolean,
     }
 
     # Reserved words (SQLite keywords)
