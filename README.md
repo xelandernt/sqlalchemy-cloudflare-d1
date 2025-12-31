@@ -1,14 +1,22 @@
+<p align="center">
+  <img src="./assets/sqlalchemy-logo.png" alt="SQLAlchemy" height="60">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="./assets/d1-logo.png" alt="Cloudflare D1" height="60">
+</p>
+
 # SQLAlchemy Cloudflare D1 Dialect
 
-A SQLAlchemy dialect for [Cloudflare's D1 Serverless SQLite Database](https://developers.cloudflare.com/d1/) using the REST API.
+A SQLAlchemy dialect for [Cloudflare's D1 Serverless SQLite Database](https://developers.cloudflare.com/d1/) supporting both the REST API and Python Workers.
 
 ## Features
 
 - Full SQLAlchemy ORM and Core support
-- Async and sync query execution via D1 REST API
+- **Sync and async engines** via D1 REST API (`create_engine` and `create_async_engine`)
+- **Python Workers support** with direct D1 binding (`create_engine_from_binding`)
 - SQLite/D1 compatible SQL compilation
 - Prepared statement support with parameter binding
-- Connection pooling and management
+- pandas `DataFrame.to_sql()` with upsert support
+- JSON column filtering with `json_each()`
 - Type mapping for D1/SQLite data types
 
 ## Installation
@@ -17,12 +25,20 @@ A SQLAlchemy dialect for [Cloudflare's D1 Serverless SQLite Database](https://de
 pip install sqlalchemy-cloudflare-d1
 ```
 
+For async SQLAlchemy engine support (`create_async_engine`):
+
+```bash
+pip install sqlalchemy-cloudflare-d1[async]
+```
+
+> **Why two install options?** SQLAlchemy's async engine requires `greenlet`, a C extension that doesn't work in Cloudflare Workers (Pyodide). The base install works everywhere, including Workers. The `[async]` extra adds `greenlet` for server-side async engine usage.
+
 Or install from source:
 
 ```bash
 git clone https://github.com/collierking/sqlalchemy-cloudflare-d1.git
 cd sqlalchemy-cloudflare-d1
-pip install -e .
+pip install -e ".[async]"
 ```
 
 ## Prerequisites
@@ -146,6 +162,158 @@ with engine.connect() as conn:
         print(row)
 ```
 
+### Async Engine Example
+
+For async applications, use `create_async_engine` (requires `pip install sqlalchemy-cloudflare-d1[async]`):
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import select, Column, Integer, String, MetaData, Table
+
+# Note the +async suffix in the URL
+engine = create_async_engine(
+    "cloudflare_d1+async://account_id:api_token@database_id"
+)
+
+metadata = MetaData()
+users = Table('users', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('name', String(50))
+)
+
+async def main():
+    # Create tables
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+
+    # Query data
+    async with engine.connect() as conn:
+        result = await conn.execute(select(users))
+        rows = result.fetchall()
+        for row in rows:
+            print(row)
+
+    await engine.dispose()
+```
+
+### Async Connection (Without SQLAlchemy)
+
+For direct async access without SQLAlchemy overhead:
+
+```python
+from sqlalchemy_cloudflare_d1 import AsyncConnection
+
+async with AsyncConnection(
+    account_id="your_account_id",
+    database_id="your_database_id",
+    api_token="your_api_token",
+) as conn:
+    cursor = await conn.cursor()
+    await cursor.execute("SELECT * FROM users WHERE name = ?", ("Alice",))
+    rows = await cursor.fetchall()
+    print(rows)
+```
+
+### Python Workers Example
+
+Inside Cloudflare Python Workers, use `create_engine_from_binding()` for direct D1 binding access (no REST API calls):
+
+```python
+from workers import WorkerEntrypoint
+from sqlalchemy import MetaData, Table, select
+from sqlalchemy_cloudflare_d1 import create_engine_from_binding
+
+class MyWorker(WorkerEntrypoint):
+    async def fetch(self, request):
+        # Create engine from D1 binding (defined in wrangler.toml)
+        engine = create_engine_from_binding(self.env.DB)
+
+        # Use SQLAlchemy Core as normal
+        metadata = MetaData()
+        users = Table('users', metadata, autoload_with=engine)
+
+        with engine.connect() as conn:
+            result = conn.execute(select(users).limit(10))
+            rows = result.fetchall()
+
+        return Response.json({"users": [dict(row) for row in rows]})
+```
+
+For raw cursor access in Workers:
+
+```python
+from sqlalchemy_cloudflare_d1 import WorkerConnection
+
+class MyWorker(WorkerEntrypoint):
+    async def fetch(self, request):
+        conn = WorkerConnection(self.env.DB)
+        cursor = conn.cursor()
+        await cursor.execute_async("SELECT * FROM users")
+        rows = cursor.fetchall()
+        conn.close()
+        return Response.json({"users": rows})
+```
+
+### pandas DataFrame.to_sql()
+
+Insert DataFrames with conflict handling:
+
+```python
+import pandas as pd
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+engine = create_engine("cloudflare_d1://account_id:api_token@database_id")
+
+df = pd.DataFrame({
+    "name": ["Alice", "Bob", "Charlie"],
+    "score": [85, 92, 78]
+})
+
+# Basic insert
+df.to_sql("scores", con=engine, if_exists="append", index=False)
+
+# Upsert with OR REPLACE (updates existing rows on conflict)
+def sqlite_upsert(table, conn, keys, data_iter):
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    sa_table = getattr(table, "table", table)
+    rows = [dict(zip(keys, row)) for row in data_iter]
+    if rows:
+        stmt = sqlite_insert(sa_table).values(rows).prefix_with("OR REPLACE")
+        conn.execute(stmt)
+
+df.to_sql("scores", con=engine, if_exists="append", index=False, method=sqlite_upsert)
+```
+
+### JSON Column Filtering
+
+Query JSON arrays stored in TEXT columns using SQLite's `json_each()`:
+
+```python
+import json
+from sqlalchemy import MetaData, Table, Column, Integer, String, select, exists, func
+
+metadata = MetaData()
+posts = Table('posts', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('title', String(100)),
+    Column('tags', String),  # JSON array stored as TEXT: '["python", "sql"]'
+)
+
+with engine.connect() as conn:
+    # Find posts tagged with "python"
+    je = func.json_each(posts.c.tags).table_valued("value").alias("je")
+    stmt = (
+        select(posts.c.title)
+        .where(exists(
+            select(1).select_from(je).where(je.c.value == "python")
+        ))
+    )
+    result = conn.execute(stmt)
+    for row in result:
+        print(row.title)
+```
+
 ## Configuration
 
 ### Connection Parameters
@@ -192,6 +360,10 @@ This dialect has some limitations due to D1's REST API nature:
 3. **Limited concurrency**: Connections are HTTP-based, not persistent database connections.
 4. **No stored procedures**: D1 doesn't support stored procedures or custom functions.
 5. **Rate limiting**: Subject to Cloudflare API rate limits.
+
+## Known Issues Fixed
+
+- **Empty result sets** (v0.3.0+): `cursor.description` is now correctly populated even when queries return zero rows, fixing `NoSuchColumnError` exceptions in SQLAlchemy.
 
 ## Type Mapping
 

@@ -6,8 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "webtypy>=0.1.7",
-    "sqlalchemy-cloudflare-d1>=0.3.1",
+    "pandas>=2.0.0",
+    "sqlalchemy-cloudflare-d1",
 ]
+
+[tool.uv.sources]
+# Use local version for testing - comment out for production
+sqlalchemy-cloudflare-d1 = { path = "../..", editable = true }
 
 [dependency-groups]
 dev = [
