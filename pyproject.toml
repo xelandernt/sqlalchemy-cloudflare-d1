@@ -1,6 +1,6 @@
 [project]
 name = "sqlalchemy-cloudflare-d1"
-version = "0.3.1"
+version = "0.3.2"
 description = "A SQLAlchemy dialect for Cloudflare's D1 Serverless SQLite Database"
 readme = "README.md"
 authors = [
@@ -84,6 +84,7 @@ addopts = "--ignore=tests/integration"
 dev = [
     "codespell>=2.4.1",
     "mypy>=1.17.0",
+    "pandas>=2.0.0",
     "pytest>=8.4.1",
     "pytest-asyncio>=0.21.0",
     "pytest-socket>=0.7.0",

@@ -15,9 +15,13 @@ test tests:
 test_watch:
 	uv run ptw --snapshot-update --now . -- -vv tests/
 
-## Run integration tests (with network access)
+## Run integration tests (REST API + Workers, requires credentials)
 integration_test integration_tests:
-	uv run pytest -m integration tests/
+	@echo "Loading .env and running integration tests..."
+	@bash -c 'set -a && source .env 2>/dev/null || true && set +a && \
+		export TEST_CF_API_TOKEN=$${TEST_CF_API_TOKEN:-$$CF_API_TOKEN} && \
+		unset VIRTUAL_ENV && \
+		uv run pytest tests/integration/ -v'
 
 ## Run all checks (lint + test)
 check: lint test

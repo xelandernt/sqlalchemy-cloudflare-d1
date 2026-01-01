@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 
+## [0.3.2]
+
+### Fixed
+
+- Fixed `NoSuchColumnError` when querying empty result sets ([#4](https://github.com/CollierKing/sqlalchemy-cloudflare-d1/issues/4))
+  - Queries returning 0 rows no longer raise `NoSuchColumnError: Could not locate column in row for column`
+  - Switched REST API from `/query` to `/raw` endpoint to get column metadata even on empty results
+  - Switched Worker binding from `stmt.all()` to `stmt.raw({columnNames: true})` for reliable column metadata
+
+### Changed
+
+- REST API now uses `/raw` endpoint instead of `/query` for query execution
+- Worker bindings now use `raw({columnNames: true})` instead of `all()` for result fetching
+- `cursor.description` is now reliably populated with column names even when results are empty
+
+
 ## [0.3.1]
 
 ### Added

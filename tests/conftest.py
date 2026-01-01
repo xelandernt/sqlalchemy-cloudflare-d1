@@ -1,13 +1,23 @@
 """Pytest configuration and fixtures for testing the D1 Python Worker."""
 
+import os
 import shutil
 import socket
 import subprocess
 import time
+import uuid
 from contextlib import closing
 from pathlib import Path
 
 import pytest
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine
+
+from tests.test_utils import (
+    make_sqlite_method,
+    make_sqlite_upsert_method,
+    SQLI_PAYLOADS,
+    PANDAS_BASIC_DATA,
+)
 
 
 def sync_package_to_python_modules(project_dir: Path) -> None:
@@ -138,6 +148,7 @@ def dev_server(initialized_worker):
     Yields:
         int: The port number the server is running on
     """
+
     project_dir = get_worker_project_dir()
 
     process = None
@@ -146,12 +157,25 @@ def dev_server(initialized_worker):
         yield port
     finally:
         if process is not None:
-            process.terminate()
+            # Kill the entire process group to clean up workerd child processes
             try:
-                process.wait(timeout=5)
+                # Try graceful termination first
+                process.terminate()
+                process.wait(timeout=3)
             except subprocess.TimeoutExpired:
+                # Force kill if it doesn't terminate
                 process.kill()
                 process.wait()
+
+            # Also kill any orphaned workerd processes on this port
+            try:
+                subprocess.run(
+                    ["pkill", "-f", f"workerd.*{port}"],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
 
 
 @pytest.fixture
@@ -164,3 +188,158 @@ def worker_project_dir():
 def project_dir():
     """Return the project root directory."""
     return Path(__file__).parent.parent
+
+
+# MARK: - Shared Test Fixtures
+
+
+@pytest.fixture
+def test_table_name():
+    """Generate a unique test table name."""
+    return f"test_sqlalchemy_{uuid.uuid4().hex[:8]}"
+
+
+@pytest.fixture
+def sqlite_insert_method():
+    """Return the make_sqlite_method helper for pandas to_sql."""
+    return make_sqlite_method
+
+
+@pytest.fixture
+def sqlite_upsert_method():
+    """Return the make_sqlite_upsert_method helper for pandas to_sql."""
+    return make_sqlite_upsert_method
+
+
+@pytest.fixture
+def sqli_payloads():
+    """Return SQL injection test payloads."""
+    return SQLI_PAYLOADS
+
+
+@pytest.fixture
+def pandas_basic_data():
+    """Return basic pandas test data."""
+    return PANDAS_BASIC_DATA.copy()
+
+
+# MARK: - REST API Fixtures
+
+
+@pytest.fixture
+def d1_credentials():
+    """Return D1 credentials from environment variables."""
+    account_id = os.environ.get("CF_ACCOUNT_ID")
+    api_token = os.environ.get("TEST_CF_API_TOKEN")
+    database_id = os.environ.get("CF_D1_DATABASE_ID")
+    return {
+        "account_id": account_id,
+        "api_token": api_token,
+        "database_id": database_id,
+        "available": all([account_id, api_token, database_id]),
+    }
+
+
+@pytest.fixture
+def d1_connection(d1_credentials):
+    """Create a real D1 connection for REST API tests."""
+    if not d1_credentials["available"]:
+        pytest.skip("D1 credentials not set")
+
+    from sqlalchemy_cloudflare_d1 import Connection
+
+    conn = Connection(
+        account_id=d1_credentials["account_id"],
+        database_id=d1_credentials["database_id"],
+        api_token=d1_credentials["api_token"],
+    )
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
+def d1_engine(d1_credentials):
+    """Create a SQLAlchemy engine connected to D1 for REST API tests."""
+    if not d1_credentials["available"]:
+        pytest.skip("D1 credentials not set")
+
+    url = (
+        f"cloudflare_d1://{d1_credentials['account_id']}:"
+        f"{d1_credentials['api_token']}@{d1_credentials['database_id']}"
+    )
+    engine = create_engine(url)
+    yield engine
+    engine.dispose()
+
+
+# MARK: - Shared Table Schema Fixtures
+
+
+@pytest.fixture
+def basic_test_table(test_table_name):
+    """Return a basic test table schema (id, name, value)."""
+    metadata = MetaData()
+    table = Table(
+        test_table_name,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String(100)),
+        Column("value", Integer),
+    )
+    return table, metadata
+
+
+@pytest.fixture
+def user_test_table(test_table_name):
+    """Return a user test table schema (id, username, email)."""
+    metadata = MetaData()
+    table = Table(
+        test_table_name,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("username", String(100)),
+        Column("email", String(100)),
+    )
+    return table, metadata
+
+
+@pytest.fixture
+def auth_test_table(test_table_name):
+    """Return an auth test table schema (id, username, password)."""
+    metadata = MetaData()
+    table = Table(
+        test_table_name,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("username", String(100)),
+        Column("password", String(100)),
+    )
+    return table, metadata
+
+
+@pytest.fixture
+def json_tags_table(test_table_name):
+    """Return a table with JSON tags column (id, name, tags)."""
+    metadata = MetaData()
+    table = Table(
+        test_table_name,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String(100)),
+        Column("tags", String),  # JSON array stored as TEXT
+    )
+    return table, metadata
+
+
+@pytest.fixture
+def scores_table(test_table_name):
+    """Return a scores table schema (id, name, score) with unique name."""
+    metadata = MetaData()
+    table = Table(
+        test_table_name,
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String(100), unique=True),
+        Column("score", Integer),
+    )
+    return table, metadata

@@ -77,6 +77,66 @@ class NotSupportedError(DatabaseError):
     pass
 
 
+# MARK: - Helper Functions
+
+
+def _prepare_parameters(parameters: Optional[Sequence]) -> Optional[List]:
+    """Convert parameters to list format for D1 API.
+
+    Args:
+        parameters: Query parameters (tuple, list, dict, or single value)
+
+    Returns:
+        List of parameters or None if no parameters
+    """
+    if not parameters:
+        return None
+
+    if isinstance(parameters, (tuple, list)):
+        return list(parameters)
+    elif isinstance(parameters, dict):
+        return list(parameters.values())
+    else:
+        return [parameters]
+
+
+def _build_description(
+    operation: str, columns: List[str], result_data: Optional[List[Dict[str, Any]]]
+) -> Optional[List[tuple]]:
+    """Build cursor description from query result.
+
+    Args:
+        operation: The SQL operation that was executed
+        columns: Column names from the query result
+        result_data: The result data rows
+
+    Returns:
+        List of 7-tuples for SELECT-like statements, None otherwise
+    """
+    operation_upper = operation.strip().upper()
+    is_select_like = (
+        operation_upper.startswith(("SELECT", "PRAGMA", "WITH"))
+        or "RETURNING" in operation_upper
+    )
+
+    if not is_select_like:
+        return None
+
+    # Build description from columns
+    if columns:
+        return [(name, None, None, None, None, None, None) for name in columns]
+    elif result_data:
+        # Fallback to first row keys if columns not available
+        first_row = result_data[0]
+        return [(name, None, None, None, None, None, None) for name in first_row.keys()]
+    else:
+        # Empty result with no column info
+        return []
+
+
+# MARK: - Row Class
+
+
 class Row:
     """Row object that behaves like both a tuple and has named access."""
 
@@ -134,12 +194,27 @@ class Row:
         raise AttributeError(f"'Row' object has no attribute '{name}'")
 
 
-class Cursor:
-    """DBAPI-compatible cursor for D1 connections."""
+# MARK: - Base Cursor Mixin
 
-    def __init__(self, connection: "Connection"):
-        """Initialize cursor with connection reference."""
-        self.connection = connection
+
+class BaseCursorMixin:
+    """Mixin providing common cursor functionality.
+
+    This mixin provides shared implementations for fetch methods, properties,
+    and iteration that are identical across all cursor types.
+    """
+
+    # These attributes must be defined by subclasses
+    _result_data: Optional[List[Dict[str, Any]]]
+    _description: Optional[List[tuple]]
+    _rowcount: int
+    _arraysize: int
+    _closed: bool
+    _position: int
+    _last_result_meta: Dict[str, Any]
+
+    def _init_cursor_state(self) -> None:
+        """Initialize common cursor state. Call from subclass __init__."""
         self._result_data = None
         self._description = None
         self._rowcount = -1
@@ -148,65 +223,22 @@ class Cursor:
         self._position = 0
         self._last_result_meta = {}
 
-    def execute(
-        self, operation: str, parameters: Optional[Sequence] = None
-    ) -> "Cursor":
-        """Execute a database operation."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
+    def _process_result(self, result: Dict[str, Any], operation: str) -> None:
+        """Process query result and update cursor state.
 
-        try:
-            result = self.connection._execute_query(operation, parameters)
-            self._result_data = result.get("results", [])
-            self._last_result_meta = result.get("meta", {})
-            self._rowcount = self._last_result_meta.get(
-                "changes", len(self._result_data)
-            )
-
-            # Always set description for SELECT-like statements
-            # Check if this looks like a SELECT statement or any statement that might return rows
-            operation_upper = operation.strip().upper()
-            if (
-                operation_upper.startswith(("SELECT", "PRAGMA", "WITH"))
-                or "RETURNING" in operation_upper
-            ):
-                if self._result_data:
-                    # Build description from first row if available
-                    first_row = self._result_data[0]
-                    self._description = [
-                        (name, None, None, None, None, None, None)
-                        for name in first_row.keys()
-                    ]
-                else:
-                    # Even if no results, we need to indicate this was a SELECT-like query
-                    # We can't know the column names without results, so we'll set an empty description
-                    # that still indicates this is a row-returning statement
-                    self._description = []
-            else:
-                # For non-SELECT statements (INSERT, UPDATE, DELETE, etc.), description should be None
-                self._description = None
-
-            self._position = 0
-            return self
-
-        except Exception as e:
-            raise OperationalError(f"Execute failed: {e}")
-
-    def executemany(
-        self, operation: str, seq_of_parameters: Sequence[Sequence]
-    ) -> "Cursor":
-        """Execute operation multiple times."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
-
-        total_rowcount = 0
-        for parameters in seq_of_parameters:
-            self.execute(operation, parameters)
-            if self._rowcount >= 0:
-                total_rowcount += self._rowcount
-
-        self._rowcount = total_rowcount
-        return self
+        Args:
+            result: The result dict from _execute_query
+            operation: The SQL operation that was executed
+        """
+        self._result_data = result.get("results", [])
+        self._last_result_meta = result.get("meta", {})
+        self._rowcount = self._last_result_meta.get(
+            "changes", len(self._result_data) if self._result_data else 0
+        )
+        self._description = _build_description(
+            operation, result.get("columns", []), self._result_data
+        )
+        self._position = 0
 
     def fetchone(self) -> Optional[tuple]:
         """Fetch next row as a tuple."""
@@ -219,12 +251,10 @@ class Cursor:
         row_data = self._result_data[self._position]
         self._position += 1
 
-        # Return a tuple of values in the order they appear in the description
         if self._description:
             column_names = [desc[0] for desc in self._description]
             return tuple(row_data.get(name) for name in column_names)
         else:
-            # If no description, return values in the order they appear in the dict
             return tuple(row_data.values())
 
     def fetchmany(self, size: Optional[int] = None) -> List[tuple]:
@@ -266,12 +296,7 @@ class Cursor:
 
     @property
     def description(self) -> Optional[List[tuple]]:
-        """Get column descriptions.
-
-        Returns:
-            List of 7-tuples (name, type_code, display_size, internal_size,
-            precision, scale, null_ok) for each column, or None for non-SELECT statements.
-        """
+        """Get column descriptions."""
         return self._description
 
     @property
@@ -281,7 +306,7 @@ class Cursor:
 
     @property
     def arraysize(self) -> int:
-        """Get/set array size for fetchmany."""
+        """Get array size for fetchmany."""
         return self._arraysize
 
     @arraysize.setter
@@ -292,9 +317,7 @@ class Cursor:
     @property
     def lastrowid(self) -> Optional[int]:
         """Get the ID of the last inserted row."""
-        if hasattr(self, "_last_result_meta"):
-            return self._last_result_meta.get("last_row_id")
-        return None
+        return self._last_result_meta.get("last_row_id")
 
     def __iter__(self):
         """Make cursor iterable."""
@@ -306,6 +329,51 @@ class Cursor:
         if row is None:
             raise StopIteration
         return row
+
+
+# MARK: - Sync REST API Cursor
+
+
+class Cursor(BaseCursorMixin):
+    """DBAPI-compatible cursor for D1 connections."""
+
+    def __init__(self, connection: "Connection"):
+        """Initialize cursor with connection reference."""
+        self.connection = connection
+        self._init_cursor_state()
+
+    def execute(
+        self, operation: str, parameters: Optional[Sequence] = None
+    ) -> "Cursor":
+        """Execute a database operation."""
+        if self._closed:
+            raise ProgrammingError("Cursor is closed")
+
+        try:
+            result = self.connection._execute_query(operation, parameters)
+            self._process_result(result, operation)
+            return self
+        except Exception as e:
+            raise OperationalError(f"Execute failed: {e}")
+
+    def executemany(
+        self, operation: str, seq_of_parameters: Sequence[Sequence]
+    ) -> "Cursor":
+        """Execute operation multiple times."""
+        if self._closed:
+            raise ProgrammingError("Cursor is closed")
+
+        total_rowcount = 0
+        for parameters in seq_of_parameters:
+            self.execute(operation, parameters)
+            if self._rowcount >= 0:
+                total_rowcount += self._rowcount
+
+        self._rowcount = total_rowcount
+        return self
+
+
+# MARK: - Sync REST API Connection
 
 
 class Connection:
@@ -374,22 +442,15 @@ class Connection:
             raise InterfaceError("Connection is closed")
 
         # Prepare the request payload
-        payload = {"sql": query}
-
-        if parameters:
-            # Convert parameters to list for D1 API
-            if isinstance(parameters, (tuple, list)):
-                payload["params"] = list(parameters)
-            elif isinstance(parameters, dict):
-                # Handle named parameters by converting to positional
-                # This is a simple implementation - more complex queries might need better handling
-                payload["params"] = list(parameters.values())
-            else:
-                payload["params"] = [parameters]
+        payload: Dict[str, Any] = {"sql": query}
+        params = _prepare_parameters(parameters)
+        if params:
+            payload["params"] = params
 
         try:
-            # Make the request to D1 REST API
-            response = self.client.post(f"{self.base_url}/query", json=payload)
+            # MARK: - Make request to D1 REST API /raw endpoint
+            # Use /raw endpoint to get column names even on empty results
+            response = self.client.post(f"{self.base_url}/raw", json=payload)
             response.raise_for_status()
 
             # Parse response
@@ -403,17 +464,28 @@ class Connection:
                 else:
                     raise OperationalError("D1 API request failed")
 
-            # Extract result data
+            # MARK: - Extract result data from /raw response format
+            # /raw returns: {"result": [{"results": {"columns": [...], "rows": [...]}, "meta": {...}}]}
             result_data = data.get("result", [])
             if result_data:
                 query_result = result_data[0]
+                raw_results = query_result.get("results", {})
+                columns = raw_results.get("columns", [])
+                rows = raw_results.get("rows", [])
+
+                # Convert rows from arrays to dicts using column names
+                results = []
+                for row in rows:
+                    results.append(dict(zip(columns, row)))
+
                 return {
-                    "results": query_result.get("results", []),
+                    "results": results,
+                    "columns": columns,
                     "meta": query_result.get("meta", {}),
                     "success": query_result.get("success", True),
                 }
             else:
-                return {"results": [], "meta": {}, "success": True}
+                return {"results": [], "columns": [], "meta": {}, "success": True}
 
         except httpx.RequestError as e:
             raise OperationalError(f"HTTP request failed: {e}")
@@ -509,44 +581,40 @@ class WorkerConnection:
                 else:
                     stmt = stmt.bind(parameters)
 
-            # Execute and get results
-            result = await stmt.all()
+            # MARK: - Execute using raw({columnNames: true}) for reliable column metadata
+            # This returns column names even on empty results
+            raw_result = await stmt.raw({"columnNames": True})
 
-            # Extract results - D1 binding returns object with results and meta
-            # In Pyodide/Workers, these are JsProxy objects that need .to_py() conversion
+            # Convert JsProxy to Python list if needed
+            if hasattr(raw_result, "to_py"):
+                raw_result = raw_result.to_py()
+
+            # raw() returns array of arrays: first row is column names, rest are data
+            columns = []
             results = []
-            if hasattr(result, "results") and result.results:
-                # Convert JsProxy to Python list if needed
-                results_data = result.results
-                if hasattr(results_data, "to_py"):
-                    results_data = results_data.to_py()
 
-                # Convert each result row to a dict
-                for row in results_data:
+            if raw_result and len(raw_result) > 0:
+                # First row contains column names
+                first_row = raw_result[0]
+                if hasattr(first_row, "to_py"):
+                    first_row = first_row.to_py()
+                columns = list(first_row) if first_row else []
+
+                # Remaining rows are data
+                for row in raw_result[1:]:
                     if hasattr(row, "to_py"):
                         row = row.to_py()
-                    if isinstance(row, dict):
-                        results.append(row)
-                    elif hasattr(row, "__dict__"):
-                        results.append(dict(row.__dict__))
-                    else:
-                        # Try to convert to dict
-                        results.append(dict(row))
+                    # Convert row array to dict using column names
+                    row_dict = dict(zip(columns, row))
+                    results.append(row_dict)
 
-            meta = {}
-            if hasattr(result, "meta") and result.meta:
-                meta_data = result.meta
-                if hasattr(meta_data, "to_py"):
-                    meta_data = meta_data.to_py()
-                if isinstance(meta_data, dict):
-                    meta = meta_data
-                elif hasattr(meta_data, "__dict__"):
-                    meta = dict(meta_data.__dict__)
-
+            # Note: raw() doesn't return meta, so we return empty meta
+            # If meta is needed, we'd need a separate call
             return {
                 "results": results,
-                "meta": meta,
-                "success": getattr(result, "success", True),
+                "columns": columns,
+                "meta": {},
+                "success": True,
             }
 
         except Exception as e:
@@ -563,19 +631,13 @@ class WorkerConnection:
         return self._d1
 
 
-class WorkerCursor:
+class WorkerCursor(BaseCursorMixin):
     """DBAPI-compatible cursor for D1 Worker bindings."""
 
     def __init__(self, connection: WorkerConnection):
         """Initialize cursor with Worker connection reference."""
         self.connection = connection
-        self._result_data: Optional[List[Dict[str, Any]]] = None
-        self._description: Optional[List[tuple]] = None
-        self._rowcount = -1
-        self._arraysize = 1
-        self._closed = False
-        self._position = 0
-        self._last_result_meta: Dict[str, Any] = {}
+        self._init_cursor_state()
 
     def execute(
         self, operation: str, parameters: Optional[Sequence] = None
@@ -594,127 +656,13 @@ class WorkerCursor:
 
         try:
             result = await self.connection._execute_query_async(operation, parameters)
-            self._result_data = result.get("results", [])
-            self._last_result_meta = result.get("meta", {})
-            self._rowcount = self._last_result_meta.get(
-                "changes", len(self._result_data) if self._result_data else 0
-            )
-
-            # Set description for SELECT-like statements
-            operation_upper = operation.strip().upper()
-            if (
-                operation_upper.startswith(("SELECT", "PRAGMA", "WITH"))
-                or "RETURNING" in operation_upper
-            ):
-                if self._result_data:
-                    first_row = self._result_data[0]
-                    self._description = [
-                        (name, None, None, None, None, None, None)
-                        for name in first_row.keys()
-                    ]
-                else:
-                    self._description = []
-            else:
-                self._description = None
-
-            self._position = 0
+            self._process_result(result, operation)
             return self
-
         except Exception as e:
             raise OperationalError(f"Execute failed: {e}")
 
-    def fetchone(self) -> Optional[tuple]:
-        """Fetch next row as a tuple."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
 
-        if not self._result_data or self._position >= len(self._result_data):
-            return None
-
-        row_data = self._result_data[self._position]
-        self._position += 1
-
-        if self._description:
-            column_names = [desc[0] for desc in self._description]
-            return tuple(row_data.get(name) for name in column_names)
-        else:
-            return tuple(row_data.values())
-
-    def fetchmany(self, size: Optional[int] = None) -> List[tuple]:
-        """Fetch multiple rows."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
-
-        if size is None:
-            size = self._arraysize
-
-        rows = []
-        for _ in range(size):
-            row = self.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-
-        return rows
-
-    def fetchall(self) -> List[tuple]:
-        """Fetch all remaining rows."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
-
-        rows = []
-        while True:
-            row = self.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-
-        return rows
-
-    def close(self) -> None:
-        """Close the cursor."""
-        self._closed = True
-        self._result_data = None
-        self._description = None
-
-    @property
-    def description(self) -> Optional[List[tuple]]:
-        """Get column descriptions."""
-        return self._description
-
-    @property
-    def rowcount(self) -> int:
-        """Get number of affected rows."""
-        return self._rowcount
-
-    @property
-    def arraysize(self) -> int:
-        """Get array size for fetchmany."""
-        return self._arraysize
-
-    @arraysize.setter
-    def arraysize(self, size: int) -> None:
-        """Set array size for fetchmany."""
-        self._arraysize = size
-
-    @property
-    def lastrowid(self) -> Optional[int]:
-        """Get the ID of the last inserted row."""
-        return self._last_result_meta.get("last_row_id")
-
-    def __iter__(self):
-        """Make cursor iterable."""
-        return self
-
-    def __next__(self):
-        """Get next row for iteration."""
-        row = self.fetchone()
-        if row is None:
-            raise StopIteration
-        return row
-
-
-# DBAPI module interface
+# MARK: - DBAPI Module Interface
 class CloudflareD1DBAPI:
     """DBAPI module for Cloudflare D1."""
 
@@ -844,19 +792,14 @@ class AsyncConnection:
 
         # Prepare the request payload
         payload: Dict[str, Any] = {"sql": query}
-
-        if parameters:
-            # Convert parameters to list for D1 API
-            if isinstance(parameters, (tuple, list)):
-                payload["params"] = list(parameters)
-            elif isinstance(parameters, dict):
-                payload["params"] = list(parameters.values())
-            else:
-                payload["params"] = [parameters]
+        params = _prepare_parameters(parameters)
+        if params:
+            payload["params"] = params
 
         try:
-            # Make the async request to D1 REST API
-            response = await self.client.post(f"{self.base_url}/query", json=payload)
+            # MARK: - Make async request to D1 REST API /raw endpoint
+            # Use /raw endpoint to get column names even on empty results
+            response = await self.client.post(f"{self.base_url}/raw", json=payload)
             response.raise_for_status()
 
             # Parse response
@@ -870,17 +813,28 @@ class AsyncConnection:
                 else:
                     raise OperationalError("D1 API request failed")
 
-            # Extract result data
+            # MARK: - Extract result data from /raw response format
+            # /raw returns: {"result": [{"results": {"columns": [...], "rows": [...]}, "meta": {...}}]}
             result_data = data.get("result", [])
             if result_data:
                 query_result = result_data[0]
+                raw_results = query_result.get("results", {})
+                columns = raw_results.get("columns", [])
+                rows = raw_results.get("rows", [])
+
+                # Convert rows from arrays to dicts using column names
+                results = []
+                for row in rows:
+                    results.append(dict(zip(columns, row)))
+
                 return {
-                    "results": query_result.get("results", []),
+                    "results": results,
+                    "columns": columns,
                     "meta": query_result.get("meta", {}),
                     "success": query_result.get("success", True),
                 }
             else:
-                return {"results": [], "meta": {}, "success": True}
+                return {"results": [], "columns": [], "meta": {}, "success": True}
 
         except httpx.RequestError as e:
             raise OperationalError(f"HTTP request failed: {e}")
@@ -895,19 +849,18 @@ class AsyncConnection:
         return self._closed
 
 
-class AsyncCursor:
-    """Async DBAPI-compatible cursor for D1 connections."""
+class AsyncCursor(BaseCursorMixin):
+    """Async DBAPI-compatible cursor for D1 connections.
+
+    Note: This extends BaseCursorMixin but overrides fetch methods with async versions.
+    The sync fetchone/fetchmany/fetchall from BaseCursorMixin are intentionally hidden
+    by the async versions defined here.
+    """
 
     def __init__(self, connection: AsyncConnection):
         """Initialize async cursor with connection reference."""
         self.connection = connection
-        self._result_data: Optional[List[Dict[str, Any]]] = None
-        self._description: Optional[List[tuple]] = None
-        self._rowcount = -1
-        self._arraysize = 1
-        self._closed = False
-        self._position = 0
-        self._last_result_meta: Dict[str, Any] = {}
+        self._init_cursor_state()
 
     async def __aenter__(self) -> "AsyncCursor":
         """Async context manager entry."""
@@ -926,32 +879,8 @@ class AsyncCursor:
 
         try:
             result = await self.connection._execute_query(operation, parameters)
-            self._result_data = result.get("results", [])
-            self._last_result_meta = result.get("meta", {})
-            self._rowcount = self._last_result_meta.get(
-                "changes", len(self._result_data) if self._result_data else 0
-            )
-
-            # Set description for SELECT-like statements
-            operation_upper = operation.strip().upper()
-            if (
-                operation_upper.startswith(("SELECT", "PRAGMA", "WITH"))
-                or "RETURNING" in operation_upper
-            ):
-                if self._result_data:
-                    first_row = self._result_data[0]
-                    self._description = [
-                        (name, None, None, None, None, None, None)
-                        for name in first_row.keys()
-                    ]
-                else:
-                    self._description = []
-            else:
-                self._description = None
-
-            self._position = 0
+            self._process_result(result, operation)
             return self
-
         except Exception as e:
             if isinstance(e, (OperationalError, ProgrammingError)):
                 raise
@@ -973,24 +902,12 @@ class AsyncCursor:
         self._rowcount = total_rowcount
         return self
 
-    async def fetchone(self) -> Optional[tuple]:
-        """Fetch next row as a tuple."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
+    async def fetchone(self) -> Optional[tuple]:  # type: ignore[override]
+        """Fetch next row as a tuple (async version)."""
+        # Note: Uses sync implementation from mixin, wrapped as async for API compatibility
+        return BaseCursorMixin.fetchone(self)
 
-        if not self._result_data or self._position >= len(self._result_data):
-            return None
-
-        row_data = self._result_data[self._position]
-        self._position += 1
-
-        if self._description:
-            column_names = [desc[0] for desc in self._description]
-            return tuple(row_data.get(name) for name in column_names)
-        else:
-            return tuple(row_data.values())
-
-    async def fetchmany(self, size: Optional[int] = None) -> List[tuple]:
+    async def fetchmany(self, size: Optional[int] = None) -> List[tuple]:  # type: ignore[override]
         """Fetch multiple rows asynchronously."""
         if self._closed:
             raise ProgrammingError("Cursor is closed")
@@ -1007,7 +924,7 @@ class AsyncCursor:
 
         return rows
 
-    async def fetchall(self) -> List[tuple]:
+    async def fetchall(self) -> List[tuple]:  # type: ignore[override]
         """Fetch all remaining rows asynchronously."""
         if self._closed:
             raise ProgrammingError("Cursor is closed")
@@ -1021,36 +938,9 @@ class AsyncCursor:
 
         return rows
 
-    async def close(self) -> None:
-        """Close the cursor."""
-        self._closed = True
-        self._result_data = None
-        self._description = None
-
-    @property
-    def description(self) -> Optional[List[tuple]]:
-        """Get column descriptions."""
-        return self._description
-
-    @property
-    def rowcount(self) -> int:
-        """Get number of affected rows."""
-        return self._rowcount
-
-    @property
-    def arraysize(self) -> int:
-        """Get array size for fetchmany."""
-        return self._arraysize
-
-    @arraysize.setter
-    def arraysize(self, size: int) -> None:
-        """Set array size for fetchmany."""
-        self._arraysize = size
-
-    @property
-    def lastrowid(self) -> Optional[int]:
-        """Get the ID of the last inserted row."""
-        return self._last_result_meta.get("last_row_id")
+    async def close(self) -> None:  # type: ignore[override]
+        """Close the cursor (async version)."""
+        BaseCursorMixin.close(self)
 
 
 async def connect_async(**kwargs) -> AsyncConnection:
@@ -1157,10 +1047,15 @@ class SyncWorkerConnection:
                     else:
                         stmt = stmt.bind(parameters)
 
-                # Execute and get results
-                return await stmt.all()
+                # MARK: - Execute using raw({columnNames: true}) for reliable column metadata
+                # This returns column names even on empty results
+                return await stmt.raw({"columnNames": True})
 
-            result = run_sync(_run())
+            raw_result = run_sync(_run())
+
+            # Convert JsProxy to Python list if needed
+            if hasattr(raw_result, "to_py"):
+                raw_result = raw_result.to_py()
 
             def convert_js_null(value):
                 """Convert JsNull/JsUndefined to Python None."""
@@ -1175,41 +1070,33 @@ class SyncWorkerConnection:
                     return None
                 return value
 
-            def convert_row_values(row_dict):
-                """Convert all values in a row dict, handling JsNull."""
-                return {k: convert_js_null(v) for k, v in row_dict.items()}
-
-            # Extract results - D1 binding returns object with results and meta
+            # raw() returns array of arrays: first row is column names, rest are data
+            columns = []
             results = []
-            if hasattr(result, "results") and result.results:
-                results_data = result.results
-                if hasattr(results_data, "to_py"):
-                    results_data = results_data.to_py()
 
-                for row in results_data:
+            if raw_result and len(raw_result) > 0:
+                # First row contains column names
+                first_row = raw_result[0]
+                if hasattr(first_row, "to_py"):
+                    first_row = first_row.to_py()
+                columns = list(first_row) if first_row else []
+
+                # Remaining rows are data
+                for row in raw_result[1:]:
                     if hasattr(row, "to_py"):
                         row = row.to_py()
-                    if isinstance(row, dict):
-                        results.append(convert_row_values(row))
-                    elif hasattr(row, "__dict__"):
-                        results.append(convert_row_values(dict(row.__dict__)))
-                    else:
-                        results.append(convert_row_values(dict(row)))
+                    # Convert row array to dict using column names, handling JsNull
+                    row_dict = {
+                        col: convert_js_null(val) for col, val in zip(columns, row)
+                    }
+                    results.append(row_dict)
 
-            meta = {}
-            if hasattr(result, "meta") and result.meta:
-                meta_data = result.meta
-                if hasattr(meta_data, "to_py"):
-                    meta_data = meta_data.to_py()
-                if isinstance(meta_data, dict):
-                    meta = meta_data
-                elif hasattr(meta_data, "__dict__"):
-                    meta = dict(meta_data.__dict__)
-
+            # Note: raw() doesn't return meta, so we return empty meta
             return {
                 "results": results,
-                "meta": meta,
-                "success": getattr(result, "success", True),
+                "columns": columns,
+                "meta": {},
+                "success": True,
             }
 
         except ImportError:
@@ -1226,7 +1113,7 @@ class SyncWorkerConnection:
         return self._closed
 
 
-class SyncWorkerCursor:
+class SyncWorkerCursor(BaseCursorMixin):
     """Synchronous DBAPI-compatible cursor for D1 Worker bindings.
 
     This wraps the async cursor to provide synchronous methods for SQLAlchemy.
@@ -1235,13 +1122,7 @@ class SyncWorkerCursor:
     def __init__(self, connection: SyncWorkerConnection):
         """Initialize cursor with Worker connection reference."""
         self.connection = connection
-        self._result_data: Optional[List[Dict[str, Any]]] = None
-        self._description: Optional[List[tuple]] = None
-        self._rowcount = -1
-        self._arraysize = 1
-        self._closed = False
-        self._position = 0
-        self._last_result_meta: Dict[str, Any] = {}
+        self._init_cursor_state()
 
     def execute(
         self, operation: str, parameters: Optional[Sequence] = None
@@ -1252,32 +1133,8 @@ class SyncWorkerCursor:
 
         try:
             result = self.connection._execute_query(operation, parameters)
-            self._result_data = result.get("results", [])
-            self._last_result_meta = result.get("meta", {})
-            self._rowcount = self._last_result_meta.get(
-                "changes", len(self._result_data) if self._result_data else 0
-            )
-
-            # Set description for SELECT-like statements
-            operation_upper = operation.strip().upper()
-            if (
-                operation_upper.startswith(("SELECT", "PRAGMA", "WITH"))
-                or "RETURNING" in operation_upper
-            ):
-                if self._result_data:
-                    first_row = self._result_data[0]
-                    self._description = [
-                        (name, None, None, None, None, None, None)
-                        for name in first_row.keys()
-                    ]
-                else:
-                    self._description = []
-            else:
-                self._description = None
-
-            self._position = 0
+            self._process_result(result, operation)
             return self
-
         except Exception as e:
             if isinstance(e, (OperationalError, ProgrammingError, NotSupportedError)):
                 raise
@@ -1299,95 +1156,8 @@ class SyncWorkerCursor:
         self._rowcount = total_rowcount
         return self
 
-    def fetchone(self) -> Optional[tuple]:
-        """Fetch next row as a tuple."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
 
-        if not self._result_data or self._position >= len(self._result_data):
-            return None
-
-        row_data = self._result_data[self._position]
-        self._position += 1
-
-        if self._description:
-            column_names = [desc[0] for desc in self._description]
-            return tuple(row_data.get(name) for name in column_names)
-        else:
-            return tuple(row_data.values())
-
-    def fetchmany(self, size: Optional[int] = None) -> List[tuple]:
-        """Fetch multiple rows."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
-
-        if size is None:
-            size = self._arraysize
-
-        rows = []
-        for _ in range(size):
-            row = self.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-
-        return rows
-
-    def fetchall(self) -> List[tuple]:
-        """Fetch all remaining rows."""
-        if self._closed:
-            raise ProgrammingError("Cursor is closed")
-
-        rows = []
-        while True:
-            row = self.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-
-        return rows
-
-    def close(self) -> None:
-        """Close the cursor."""
-        self._closed = True
-        self._result_data = None
-        self._description = None
-
-    @property
-    def description(self) -> Optional[List[tuple]]:
-        """Get column descriptions."""
-        return self._description
-
-    @property
-    def rowcount(self) -> int:
-        """Get number of affected rows."""
-        return self._rowcount
-
-    @property
-    def arraysize(self) -> int:
-        """Get array size for fetchmany."""
-        return self._arraysize
-
-    @arraysize.setter
-    def arraysize(self, size: int) -> None:
-        """Set array size for fetchmany."""
-        self._arraysize = size
-
-    @property
-    def lastrowid(self) -> Optional[int]:
-        """Get the ID of the last inserted row."""
-        return self._last_result_meta.get("last_row_id")
-
-    def __iter__(self):
-        """Make cursor iterable."""
-        return self
-
-    def __next__(self):
-        """Get next row for iteration."""
-        row = self.fetchone()
-        if row is None:
-            raise StopIteration
-        return row
+# MARK: - Engine Factory
 
 
 def create_engine_from_binding(d1_binding: Any, **kwargs) -> Any:
