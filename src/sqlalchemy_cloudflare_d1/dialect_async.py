@@ -18,6 +18,7 @@ Usage:
 
 from collections import deque
 from typing import Any, Optional, Sequence
+import base64
 
 from sqlalchemy.engine import AdaptedConnection
 from sqlalchemy.pool import AsyncAdaptedQueuePool
@@ -266,6 +267,22 @@ class AsyncAdapt_d1_dbapi:
     InternalError = InternalError
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
+
+    @staticmethod
+    def Binary(data: bytes) -> str:
+        """Construct an object capable of holding binary data.
+
+        D1's REST API requires binary BLOB data to be base64-encoded
+        when sent via JSON. This function encodes the binary data to
+        base64 string for transmission.
+
+        Args:
+            data: Binary data as bytes
+
+        Returns:
+            Base64-encoded string for database insertion
+        """
+        return base64.b64encode(data).decode("ascii")
 
     def connect(self, **kwargs) -> AsyncAdapt_d1_connection:
         """Create an async-adapted connection.
