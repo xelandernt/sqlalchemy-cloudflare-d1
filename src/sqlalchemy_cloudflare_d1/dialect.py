@@ -3,6 +3,7 @@ SQLAlchemy dialect for Cloudflare D1.
 """
 
 from typing import Any, Callable, Dict, List, Optional
+import base64
 
 from sqlalchemy.engine import default
 from sqlalchemy.engine.interfaces import Dialect
@@ -10,6 +11,7 @@ from sqlalchemy.sql.sqltypes import (
     Boolean,
     INTEGER,
     NUMERIC,
+    LargeBinary,
     REAL,
     TEXT,
 )
@@ -24,6 +26,24 @@ from .compiler import (
 
 
 # MARK: - Custom Type Processors
+
+
+class D1LargeBinary(LargeBinary):
+    def result_processor(
+        self, dialect: Dialect, coltype: Any
+    ) -> Callable[[Any], Optional[bytes]]:
+        """Convert D1 base64-encoded string back to bytes."""
+
+        def process(value: Any) -> Optional[bytes]:
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                return value
+            if isinstance(value, str):
+                return base64.b64decode(value)
+            return value  # or raise?
+
+        return process
 
 
 class D1Boolean(Boolean):
@@ -100,6 +120,7 @@ class CloudflareD1Dialect(default.DefaultDialect):
     # Type mapping from SQLAlchemy to D1/SQLite
     colspecs = {
         Boolean: D1Boolean,
+        LargeBinary: D1LargeBinary,
     }
 
     # Reserved words (SQLite keywords)
@@ -318,7 +339,7 @@ class CloudflareD1Dialect(default.DefaultDialect):
         elif any(x in type_string for x in ["REAL", "FLOA", "DOUBLE"]):
             return REAL()
         elif "BLOB" in type_string:
-            return TEXT()  # D1 doesn't have true BLOB, everything is text-based
+            return LargeBinary()  # D1 doesn't have true BLOB, everything is text-based
         elif "NUMERIC" in type_string:
             return NUMERIC()
         else:

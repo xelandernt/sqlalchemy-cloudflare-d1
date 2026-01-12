@@ -7,6 +7,7 @@ Supports two connection modes:
 """
 
 from typing import Any, Dict, List, Optional, Sequence, Union
+import base64
 
 try:
     import httpx
@@ -688,6 +689,10 @@ class CloudflareD1DBAPI:
         """Create a new database connection."""
         return Connection(**kwargs)
 
+    @staticmethod
+    def Binary(data: bytes) -> str:
+        return base64.b64encode(data).decode("ascii")
+
 
 # For backwards compatibility, provide module-level access
 apilevel = CloudflareD1DBAPI.apilevel
@@ -982,6 +987,10 @@ class WorkerDBAPI:
     def connect(self, **kwargs) -> "SyncWorkerConnection":
         """Create a new database connection using the stored D1 binding."""
         return SyncWorkerConnection(self._d1_binding)
+
+    @staticmethod
+    def Binary(data: bytes) -> str:
+        return base64.b64encode(data).decode("ascii")
 
 
 class SyncWorkerConnection:

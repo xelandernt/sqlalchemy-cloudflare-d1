@@ -18,6 +18,7 @@ Usage:
 
 from collections import deque
 from typing import Any, Optional, Sequence
+import base64
 
 from sqlalchemy.engine import AdaptedConnection
 from sqlalchemy.pool import AsyncAdaptedQueuePool
@@ -266,6 +267,10 @@ class AsyncAdapt_d1_dbapi:
     InternalError = InternalError
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
+
+    @staticmethod
+    def Binary(data: bytes) -> str:
+        return base64.b64encode(data).decode("ascii")
 
     def connect(self, **kwargs) -> AsyncAdapt_d1_connection:
         """Create an async-adapted connection.
