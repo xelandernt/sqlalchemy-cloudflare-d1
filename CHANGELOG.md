@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 
+## [0.3.6]
+
+### Fixed
+
+- Fixed `D1_TYPE_ERROR` when inserting Python `datetime` objects ([#13](https://github.com/CollierKing/sqlalchemy-cloudflare-d1/issues/13))
+  - D1 rejects Python `datetime` objects with `D1_TYPE_ERROR: Type 'object' not supported`
+  - Added `D1DateTime` type processor that converts `datetime` to ISO 8601 strings on bind and parses them back on result
+  - Supports timezone-aware datetimes (UTC and non-UTC offsets), nullable columns, and ORM usage
+  - Works in both REST API and Worker modes
+
+
 ## [0.3.5]
 
 ### Fixed

@@ -115,6 +115,22 @@ class Default(WorkerEntrypoint):
             return await self.test_single_row_sqlalchemy()
         elif path == "multi-row-result":
             return await self.test_multi_row_result()
+        # Autoincrement insert tests (GitHub issue #12)
+        elif path == "autoincrement-insert":
+            return await self.test_autoincrement_insert()
+        elif path == "autoincrement-insert-sqlalchemy":
+            return await self.test_autoincrement_insert_sqlalchemy()
+        elif path == "autoincrement-lastrowid":
+            return await self.test_autoincrement_lastrowid()
+        # DateTime column tests (GitHub issue #13)
+        elif path == "datetime-basic":
+            return await self.test_datetime_basic()
+        elif path == "datetime-non-utc":
+            return await self.test_datetime_non_utc()
+        elif path == "datetime-nullable":
+            return await self.test_datetime_nullable()
+        elif path == "datetime-orm":
+            return await self.test_datetime_orm()
         else:
             return await self.index()
 
@@ -166,6 +182,10 @@ class Default(WorkerEntrypoint):
                 "/single-row-result": "Test single-row SELECT returns data correctly",
                 "/single-row-sqlalchemy": "Test single-row via SQLAlchemy engine",
                 "/multi-row-result": "Test multi-row SELECT returns correct data",
+                "/datetime-basic": "Test DateTime column insert/retrieve (issue #13)",
+                "/datetime-non-utc": "Test DateTime with non-UTC timezone",
+                "/datetime-nullable": "Test nullable DateTime columns",
+                "/datetime-orm": "Test DateTime via ORM session",
             },
             "package": "sqlalchemy-cloudflare-d1",
             "connection_type": "WorkerConnection (D1 binding)",
@@ -2650,5 +2670,508 @@ class Default(WorkerEntrypoint):
                 pass
             return Response.json(
                 {"test": "on_conflict_where", "success": False, "error": str(e)},
+                status=500,
+            )
+
+    # MARK: - Autoincrement Insert Tests (Issue #12)
+
+    async def test_autoincrement_insert(self):
+        """Test raw cursor INSERT without specifying primary key, check lastrowid."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        table_name = f"test_autoincr_{uuid.uuid4().hex[:8]}"
+        try:
+            await cursor.execute_async(
+                f"CREATE TABLE {table_name} "
+                "(id INTEGER PRIMARY KEY, title TEXT NOT NULL)"
+            )
+            await cursor.execute_async(
+                f"INSERT INTO {table_name} (title) VALUES (?)",
+                ("Hello World",),
+            )
+            last_id = cursor.lastrowid
+            meta = cursor._last_result_meta
+
+            await cursor.execute_async(
+                f"INSERT INTO {table_name} (title) VALUES (?)",
+                ("Second Entry",),
+            )
+            last_id_2 = cursor.lastrowid
+            meta_2 = cursor._last_result_meta
+
+            await cursor.execute_async(f"DROP TABLE {table_name}")
+
+            return Response.json(
+                {
+                    "test": "autoincrement_insert",
+                    "success": last_id == 1 and last_id_2 == 2,
+                    "lastrowid_1": last_id,
+                    "lastrowid_2": last_id_2,
+                    "meta_1": meta,
+                    "meta_2": meta_2,
+                }
+            )
+        except Exception as e:
+            try:
+                await cursor.execute_async(f"DROP TABLE IF EXISTS {table_name}")
+            except Exception:
+                pass
+            return Response.json(
+                {
+                    "test": "autoincrement_insert",
+                    "success": False,
+                    "error": str(e),
+                },
+                status=500,
+            )
+
+    async def test_autoincrement_insert_sqlalchemy(self):
+        """Test SQLAlchemy ORM INSERT without specifying primary key (issue #12).
+
+        This reproduces the exact scenario from the bug report:
+        session.add(News(title="...")) without setting id.
+        """
+        from sqlalchemy import Integer, String, MetaData, Table
+        from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+        engine = create_engine_from_binding(self.env.DB)
+        table_name = f"test_autoincr_orm_{uuid.uuid4().hex[:8]}"
+
+        try:
+
+            class Base(DeclarativeBase):
+                pass
+
+            class News(Base):
+                __tablename__ = table_name
+                id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+                url: Mapped[str] = mapped_column(String(511), unique=True, index=True)
+                title: Mapped[str] = mapped_column(String(127))
+
+            Base.metadata.create_all(engine)
+
+            with Session(engine) as session:
+                entry = News(
+                    url="https://example.com/first",
+                    title="First Title",
+                )
+                session.add(entry)
+                session.commit()
+                session.refresh(entry)
+                entry_id = entry.id
+                entry_title = entry.title
+
+            with Session(engine) as session:
+                entry2 = News(
+                    url="https://example.com/second",
+                    title="Second Title",
+                )
+                session.add(entry2)
+                session.commit()
+                session.refresh(entry2)
+                entry2_id = entry2.id
+
+            Base.metadata.drop_all(engine)
+
+            return Response.json(
+                {
+                    "test": "autoincrement_insert_sqlalchemy",
+                    "success": entry_id == 1 and entry2_id == 2,
+                    "entry_id": entry_id,
+                    "entry_title": entry_title,
+                    "entry2_id": entry2_id,
+                }
+            )
+        except Exception as e:
+            try:
+                metadata = MetaData()
+                Table(table_name, metadata)
+                metadata.drop_all(engine)
+            except Exception:
+                pass
+            return Response.json(
+                {
+                    "test": "autoincrement_insert_sqlalchemy",
+                    "success": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+                status=500,
+            )
+
+    async def test_autoincrement_lastrowid(self):
+        """Test that lastrowid is correctly populated from D1 meta."""
+        from sqlalchemy import Integer, String, MetaData, Table, Column
+
+        engine = create_engine_from_binding(self.env.DB)
+        metadata = MetaData()
+        table_name = f"test_autoincr_lr_{uuid.uuid4().hex[:8]}"
+
+        test_table = Table(
+            table_name,
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("title", String(127), nullable=False),
+        )
+
+        try:
+            metadata.create_all(engine)
+
+            with engine.connect() as conn:
+                result = conn.execute(test_table.insert().values(title="First"))
+                lastrowid_1 = result.inserted_primary_key[0]
+
+                result2 = conn.execute(test_table.insert().values(title="Second"))
+                lastrowid_2 = result2.inserted_primary_key[0]
+                conn.commit()
+
+            metadata.drop_all(engine)
+
+            return Response.json(
+                {
+                    "test": "autoincrement_lastrowid",
+                    "success": lastrowid_1 == 1 and lastrowid_2 == 2,
+                    "lastrowid_1": lastrowid_1,
+                    "lastrowid_2": lastrowid_2,
+                }
+            )
+        except Exception as e:
+            try:
+                metadata.drop_all(engine)
+            except Exception:
+                pass
+            return Response.json(
+                {
+                    "test": "autoincrement_lastrowid",
+                    "success": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+                status=500,
+            )
+
+    # MARK: - DateTime Column Tests (Issue #13)
+
+    async def test_datetime_basic(self):
+        """Test DateTime column insert and retrieve with timezone-aware datetimes."""
+        from datetime import datetime, timezone
+        from sqlalchemy import (
+            Column,
+            DateTime,
+            Integer,
+            MetaData,
+            String,
+            Table,
+            select,
+        )
+
+        table_name = f"test_dt_{uuid.uuid4().hex[:8]}"
+
+        try:
+            engine = self.get_engine()
+            metadata = MetaData()
+
+            test_table = Table(
+                table_name,
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("title", String(127)),
+                Column("created_at", DateTime(timezone=True)),
+            )
+
+            metadata.create_all(engine)
+
+            dt_value = datetime(2025, 12, 29, 16, 51, 29, tzinfo=timezone.utc)
+
+            with engine.connect() as conn:
+                conn.execute(
+                    test_table.insert().values(title="Test", created_at=dt_value)
+                )
+                conn.commit()
+
+                result = conn.execute(
+                    select(test_table.c.title, test_table.c.created_at)
+                )
+                row = result.fetchone()
+
+            metadata.drop_all(engine)
+
+            success = (
+                row is not None
+                and row[0] == "Test"
+                and isinstance(row[1], datetime)
+                and row[1].year == 2025
+                and row[1].month == 12
+                and row[1].day == 29
+            )
+
+            return Response.json(
+                {
+                    "test": "datetime_basic",
+                    "success": success,
+                    "title": row[0] if row else None,
+                    "created_at_type": type(row[1]).__name__ if row else None,
+                    "year": row[1].year
+                    if row and isinstance(row[1], datetime)
+                    else None,
+                }
+            )
+        except Exception as e:
+            try:
+                metadata.drop_all(engine)
+            except Exception:
+                pass
+            return Response.json(
+                {"test": "datetime_basic", "success": False, "error": str(e)},
+                status=500,
+            )
+
+    async def test_datetime_non_utc(self):
+        """Test DateTime with non-UTC timezone offset (exact scenario from issue #13)."""
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import (
+            Column,
+            DateTime,
+            Integer,
+            MetaData,
+            String,
+            Table,
+            select,
+        )
+
+        table_name = f"test_dt_tz_{uuid.uuid4().hex[:8]}"
+
+        try:
+            engine = self.get_engine()
+            metadata = MetaData()
+
+            test_table = Table(
+                table_name,
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("title", String(127)),
+                Column("origin_created_at", DateTime(timezone=True)),
+                Column("indexed_at", DateTime(timezone=True)),
+            )
+
+            metadata.create_all(engine)
+
+            tz_minus_3 = timezone(timedelta(hours=-3))
+            origin_dt = datetime(2025, 12, 29, 16, 51, 29, tzinfo=tz_minus_3)
+            indexed_dt = datetime(2026, 2, 1, 18, 22, 4, 948999, tzinfo=timezone.utc)
+
+            with engine.connect() as conn:
+                conn.execute(
+                    test_table.insert().values(
+                        title="News",
+                        origin_created_at=origin_dt,
+                        indexed_at=indexed_dt,
+                    )
+                )
+                conn.commit()
+
+                result = conn.execute(
+                    select(
+                        test_table.c.origin_created_at,
+                        test_table.c.indexed_at,
+                    )
+                )
+                row = result.fetchone()
+
+            metadata.drop_all(engine)
+
+            success = (
+                row is not None
+                and isinstance(row[0], datetime)
+                and isinstance(row[1], datetime)
+            )
+
+            return Response.json(
+                {
+                    "test": "datetime_non_utc",
+                    "success": success,
+                    "origin_type": type(row[0]).__name__ if row else None,
+                    "indexed_type": type(row[1]).__name__ if row else None,
+                }
+            )
+        except Exception as e:
+            try:
+                metadata.drop_all(engine)
+            except Exception:
+                pass
+            return Response.json(
+                {"test": "datetime_non_utc", "success": False, "error": str(e)},
+                status=500,
+            )
+
+    async def test_datetime_nullable(self):
+        """Test nullable DateTime columns handle NULL correctly."""
+        from datetime import datetime, timezone
+        from sqlalchemy import (
+            Column,
+            DateTime,
+            Integer,
+            MetaData,
+            String,
+            Table,
+            select,
+        )
+
+        table_name = f"test_dt_null_{uuid.uuid4().hex[:8]}"
+
+        try:
+            engine = self.get_engine()
+            metadata = MetaData()
+
+            test_table = Table(
+                table_name,
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("title", String(127)),
+                Column("published_at", DateTime(timezone=True), nullable=True),
+            )
+
+            metadata.create_all(engine)
+
+            with engine.connect() as conn:
+                conn.execute(
+                    test_table.insert().values(
+                        title="Published",
+                        published_at=datetime.now(timezone.utc),
+                    )
+                )
+                conn.execute(
+                    test_table.insert().values(title="Draft", published_at=None)
+                )
+                conn.commit()
+
+                result = conn.execute(
+                    select(test_table.c.title, test_table.c.published_at).order_by(
+                        test_table.c.id
+                    )
+                )
+                rows = result.fetchall()
+
+            metadata.drop_all(engine)
+
+            success = (
+                len(rows) == 2
+                and rows[0][0] == "Published"
+                and isinstance(rows[0][1], datetime)
+                and rows[1][0] == "Draft"
+                and rows[1][1] is None
+            )
+
+            return Response.json(
+                {
+                    "test": "datetime_nullable",
+                    "success": success,
+                    "published_has_datetime": isinstance(rows[0][1], datetime)
+                    if rows
+                    else False,
+                    "draft_is_none": rows[1][1] is None if len(rows) > 1 else False,
+                }
+            )
+        except Exception as e:
+            try:
+                metadata.drop_all(engine)
+            except Exception:
+                pass
+            return Response.json(
+                {"test": "datetime_nullable", "success": False, "error": str(e)},
+                status=500,
+            )
+
+    async def test_datetime_orm(self):
+        """Test DateTime via ORM session (reproduces exact issue #13 scenario)."""
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import Integer, String, Float, Text, DateTime
+        from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+        engine = create_engine_from_binding(self.env.DB)
+        table_name = f"test_dt_orm_{uuid.uuid4().hex[:8]}"
+
+        try:
+
+            class Base(DeclarativeBase):
+                pass
+
+            class News(Base):
+                __tablename__ = table_name
+                id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+                url: Mapped[str] = mapped_column(String(511), unique=True, index=True)
+                title: Mapped[str] = mapped_column(String(127))
+                content: Mapped[str] = mapped_column(Text)
+                response_elapsed_seconds: Mapped[float | None] = mapped_column(
+                    Float, nullable=True
+                )
+                origin_created_at: Mapped[datetime | None] = mapped_column(
+                    DateTime(timezone=True), nullable=True
+                )
+                indexed_at: Mapped[datetime] = mapped_column(
+                    DateTime(timezone=True),
+                    default=lambda: datetime.now(timezone.utc),
+                )
+                inserted_at: Mapped[datetime] = mapped_column(
+                    DateTime(timezone=True),
+                    default=lambda: datetime.now(timezone.utc),
+                )
+
+            Base.metadata.create_all(engine)
+
+            tz_minus_3 = timezone(timedelta(hours=-3))
+            origin_dt = datetime(2025, 12, 29, 16, 51, 29, tzinfo=tz_minus_3)
+
+            with Session(engine) as session:
+                news_entry = News(
+                    url="https://example.com/issue-13-test",
+                    title="Issue 13 DateTime Test",
+                    content="Testing datetime bind parameter conversion.",
+                    response_elapsed_seconds=0.504,
+                    origin_created_at=origin_dt,
+                    indexed_at=datetime.now(timezone.utc),
+                )
+                session.add(news_entry)
+                session.commit()
+                session.refresh(news_entry)
+                entry_id = news_entry.id
+                entry_title = news_entry.title
+                origin_is_dt = isinstance(news_entry.origin_created_at, datetime)
+                indexed_is_dt = isinstance(news_entry.indexed_at, datetime)
+                inserted_is_dt = isinstance(news_entry.inserted_at, datetime)
+
+            Base.metadata.drop_all(engine)
+
+            success = (
+                entry_id == 1 and origin_is_dt and indexed_is_dt and inserted_is_dt
+            )
+
+            return Response.json(
+                {
+                    "test": "datetime_orm",
+                    "success": success,
+                    "entry_id": entry_id,
+                    "entry_title": entry_title,
+                    "origin_is_datetime": origin_is_dt,
+                    "indexed_is_datetime": indexed_is_dt,
+                    "inserted_is_datetime": inserted_is_dt,
+                }
+            )
+        except Exception as e:
+            try:
+                from sqlalchemy import MetaData, Table
+
+                md = MetaData()
+                Table(table_name, md)
+                md.drop_all(engine)
+            except Exception:
+                pass
+            return Response.json(
+                {
+                    "test": "datetime_orm",
+                    "success": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
                 status=500,
             )
