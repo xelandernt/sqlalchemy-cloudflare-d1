@@ -13,16 +13,20 @@ Run with: pytest tests/test_d1_integration.py -v -s
 
 import os
 import uuid
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import (
     Boolean,
     Column,
+    DateTime,
+    Float,
     Integer,
     LargeBinary,
     MetaData,
     String,
     Table,
+    Text,
     func,
     select,
 )
@@ -2349,6 +2353,331 @@ class TestSingleRowResult:
             assert rows[0][1] == "row_one"
         finally:
             cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+
+# MARK: - Autoincrement Insert Tests (Issue #12)
+
+
+class TestAutoincrementInsert:
+    """Test that INTEGER PRIMARY KEY autoincrement works correctly.
+
+    Verifies that inserting rows without specifying the primary key
+    correctly auto-generates IDs and that cursor.lastrowid /
+    result.inserted_primary_key return the generated values.
+    """
+
+    def test_lastrowid_via_cursor(self, d1_connection):
+        """Test cursor.lastrowid returns the auto-generated ID after INSERT."""
+        cursor = d1_connection.cursor()
+        table_name = f"test_autoincr_{uuid.uuid4().hex[:8]}"
+
+        try:
+            cursor.execute(
+                f"CREATE TABLE {table_name} "
+                "(id INTEGER PRIMARY KEY, title TEXT NOT NULL)"
+            )
+            cursor.execute(
+                f"INSERT INTO {table_name} (title) VALUES (?)",
+                ("First",),
+            )
+            assert cursor.lastrowid == 1
+
+            cursor.execute(
+                f"INSERT INTO {table_name} (title) VALUES (?)",
+                ("Second",),
+            )
+            assert cursor.lastrowid == 2
+        finally:
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    def test_inserted_primary_key_via_sqlalchemy_core(self, d1_engine, test_table_name):
+        """Test result.inserted_primary_key returns auto-generated ID."""
+        metadata = MetaData()
+        test_table = Table(
+            test_table_name,
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("title", String(127), nullable=False),
+        )
+        metadata.create_all(d1_engine)
+
+        try:
+            with d1_engine.connect() as conn:
+                result = conn.execute(test_table.insert().values(title="First"))
+                assert result.inserted_primary_key[0] == 1
+
+                result2 = conn.execute(test_table.insert().values(title="Second"))
+                assert result2.inserted_primary_key[0] == 2
+                conn.commit()
+        finally:
+            metadata.drop_all(d1_engine)
+
+    def test_orm_session_autoincrement(self, d1_engine):
+        """Test ORM session.add() with autoincrement primary key.
+
+        Reproduces the exact scenario from issue #12 with the same model
+        definition: index=True on PK, unique+index on url, String columns.
+        """
+        from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+        table_name = f"test_autoincr_orm_{uuid.uuid4().hex[:8]}"
+
+        class Base(DeclarativeBase):
+            pass
+
+        class News(Base):
+            __tablename__ = table_name
+            id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+            url: Mapped[str] = mapped_column(String(511), unique=True, index=True)
+            title: Mapped[str] = mapped_column(String(127))
+
+        Base.metadata.create_all(d1_engine)
+
+        try:
+            with Session(d1_engine) as session:
+                entry = News(
+                    url="https://example.com/first",
+                    title="First Title",
+                )
+                session.add(entry)
+                session.commit()
+                session.refresh(entry)
+                assert entry.id == 1
+                assert entry.url == "https://example.com/first"
+                assert entry.title == "First Title"
+
+            with Session(d1_engine) as session:
+                entry2 = News(
+                    url="https://example.com/second",
+                    title="Second Title",
+                )
+                session.add(entry2)
+                session.commit()
+                session.refresh(entry2)
+                assert entry2.id == 2
+        finally:
+            Base.metadata.drop_all(d1_engine)
+
+
+# MARK: - DateTime Column Tests (Issue #13)
+
+
+class TestDateTimeColumn:
+    """Test DateTime column handling (fixes GitHub issue #13).
+
+    D1 does not accept Python datetime objects as bind parameters. The
+    D1DateTime type processor converts datetimes to ISO 8601 strings on bind
+    and parses them back on result.
+    """
+
+    def test_datetime_insert_and_retrieve(self, d1_engine, test_table_name):
+        """Test that DateTime columns can store and retrieve timezone-aware datetimes."""
+        metadata = MetaData()
+        test_table = Table(
+            test_table_name,
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("title", String(127)),
+            Column("created_at", DateTime(timezone=True)),
+        )
+
+        metadata.create_all(d1_engine)
+
+        try:
+            dt_value = datetime(2025, 12, 29, 16, 51, 29, tzinfo=UTC)
+
+            with d1_engine.connect() as conn:
+                conn.execute(
+                    test_table.insert().values(title="Test", created_at=dt_value)
+                )
+                conn.commit()
+
+                result = conn.execute(
+                    select(test_table.c.title, test_table.c.created_at)
+                )
+                row = result.fetchone()
+
+            assert row is not None
+            assert row[0] == "Test"
+            assert isinstance(row[1], datetime)
+            assert row[1].year == 2025
+            assert row[1].month == 12
+            assert row[1].day == 29
+        finally:
+            metadata.drop_all(d1_engine)
+
+    def test_datetime_with_non_utc_timezone(self, d1_engine, test_table_name):
+        """Test DateTime with non-UTC timezone offset (exact scenario from issue)."""
+        metadata = MetaData()
+        test_table = Table(
+            test_table_name,
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("title", String(127)),
+            Column("origin_created_at", DateTime(timezone=True)),
+            Column("indexed_at", DateTime(timezone=True)),
+        )
+
+        metadata.create_all(d1_engine)
+
+        try:
+            tz_minus_3 = timezone(timedelta(hours=-3))
+            origin_dt = datetime(2025, 12, 29, 16, 51, 29, tzinfo=tz_minus_3)
+            indexed_dt = datetime(2026, 2, 1, 18, 22, 4, 948999, tzinfo=UTC)
+
+            with d1_engine.connect() as conn:
+                conn.execute(
+                    test_table.insert().values(
+                        title="News Article",
+                        origin_created_at=origin_dt,
+                        indexed_at=indexed_dt,
+                    )
+                )
+                conn.commit()
+
+                result = conn.execute(
+                    select(
+                        test_table.c.origin_created_at,
+                        test_table.c.indexed_at,
+                    )
+                )
+                row = result.fetchone()
+
+            assert row is not None
+            assert isinstance(row[0], datetime)
+            assert isinstance(row[1], datetime)
+        finally:
+            metadata.drop_all(d1_engine)
+
+    def test_datetime_nullable(self, d1_engine, test_table_name):
+        """Test nullable DateTime columns handle NULL correctly."""
+        metadata = MetaData()
+        test_table = Table(
+            test_table_name,
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("title", String(127)),
+            Column("published_at", DateTime(timezone=True), nullable=True),
+        )
+
+        metadata.create_all(d1_engine)
+
+        try:
+            with d1_engine.connect() as conn:
+                conn.execute(
+                    test_table.insert().values(
+                        title="Published",
+                        published_at=datetime.now(UTC),
+                    )
+                )
+                conn.execute(
+                    test_table.insert().values(title="Draft", published_at=None)
+                )
+                conn.commit()
+
+                result = conn.execute(
+                    select(test_table.c.title, test_table.c.published_at).order_by(
+                        test_table.c.id
+                    )
+                )
+                rows = result.fetchall()
+
+            assert len(rows) == 2
+            assert rows[0][0] == "Published"
+            assert isinstance(rows[0][1], datetime)
+            assert rows[1][0] == "Draft"
+            assert rows[1][1] is None
+        finally:
+            metadata.drop_all(d1_engine)
+
+    def test_datetime_orm_session(self, d1_engine):
+        """Test DateTime via ORM session (reproduces exact issue #13 scenario)."""
+        from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+        table_name = f"test_dt_orm_{uuid.uuid4().hex[:8]}"
+
+        class Base(DeclarativeBase):
+            pass
+
+        class News(Base):
+            __tablename__ = table_name
+            id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+            url: Mapped[str] = mapped_column(String(511), unique=True, index=True)
+            title: Mapped[str] = mapped_column(String(127))
+            content: Mapped[str] = mapped_column(Text)
+            response_elapsed_seconds: Mapped[float | None] = mapped_column(
+                Float, nullable=True
+            )
+            origin_created_at: Mapped[datetime | None] = mapped_column(
+                DateTime(timezone=True), nullable=True
+            )
+            indexed_at: Mapped[datetime] = mapped_column(
+                DateTime(timezone=True), default=lambda: datetime.now(UTC)
+            )
+            inserted_at: Mapped[datetime] = mapped_column(
+                DateTime(timezone=True), default=lambda: datetime.now(UTC)
+            )
+
+        Base.metadata.create_all(d1_engine)
+
+        try:
+            tz_minus_3 = timezone(timedelta(hours=-3))
+            origin_dt = datetime(2025, 12, 29, 16, 51, 29, tzinfo=tz_minus_3)
+
+            with Session(d1_engine) as session:
+                news_entry = News(
+                    url="https://example.com/issue-13-test",
+                    title="Issue 13 DateTime Test",
+                    content="Testing datetime bind parameter conversion.",
+                    response_elapsed_seconds=0.504,
+                    origin_created_at=origin_dt,
+                    indexed_at=datetime.now(UTC),
+                )
+                session.add(news_entry)
+                session.commit()
+                session.refresh(news_entry)
+
+                assert news_entry.id == 1
+                assert news_entry.title == "Issue 13 DateTime Test"
+                assert isinstance(news_entry.origin_created_at, datetime)
+                assert isinstance(news_entry.indexed_at, datetime)
+                assert isinstance(news_entry.inserted_at, datetime)
+        finally:
+            Base.metadata.drop_all(d1_engine)
+
+    def test_datetime_filter_query(self, d1_engine, test_table_name):
+        """Test filtering by DateTime column values."""
+        metadata = MetaData()
+        test_table = Table(
+            test_table_name,
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("title", String(127)),
+            Column("created_at", DateTime(timezone=True)),
+        )
+
+        metadata.create_all(d1_engine)
+
+        try:
+            dt_old = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+            dt_new = datetime(2025, 6, 15, 12, 0, 0, tzinfo=UTC)
+
+            with d1_engine.connect() as conn:
+                conn.execute(test_table.insert().values(title="Old", created_at=dt_old))
+                conn.execute(test_table.insert().values(title="New", created_at=dt_new))
+                conn.commit()
+
+                # Filter for entries after 2025-01-01
+                cutoff = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC).isoformat()
+                result = conn.execute(
+                    select(test_table.c.title).where(test_table.c.created_at > cutoff)
+                )
+                rows = result.fetchall()
+
+            assert len(rows) == 1
+            assert rows[0][0] == "New"
+        finally:
+            metadata.drop_all(d1_engine)
 
 
 if __name__ == "__main__":

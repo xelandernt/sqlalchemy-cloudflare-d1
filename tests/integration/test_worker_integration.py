@@ -709,3 +709,154 @@ class TestSingleRowResult:
         assert data["success"] is True
         assert data["row_count"] == 3
         assert data["description_names"] == ["id", "name", "value"]
+
+
+# MARK: - Autoincrement Insert Tests (Issue #12)
+
+
+class TestAutoincrementInsert:
+    """Test that INTEGER PRIMARY KEY autoincrement works correctly.
+
+    Verifies that inserting rows without specifying the primary key
+    correctly auto-generates IDs and that cursor.lastrowid /
+    result.inserted_primary_key return the generated values.
+    """
+
+    def test_lastrowid_via_cursor(self, dev_server):
+        """Test cursor.lastrowid returns the auto-generated ID after INSERT."""
+        port = dev_server
+        response = requests.get(f"http://localhost:{port}/autoincrement-insert")
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["test"] == "autoincrement_insert"
+        assert data["success"] is True, (
+            f"lastrowid failed: lastrowid_1={data.get('lastrowid_1')}, "
+            f"lastrowid_2={data.get('lastrowid_2')}, "
+            f"meta_1={data.get('meta_1')}"
+        )
+        assert data["lastrowid_1"] == 1
+        assert data["lastrowid_2"] == 2
+
+    def test_orm_session_autoincrement(self, dev_server):
+        """Test ORM session.add() with autoincrement primary key.
+
+        Reproduces the exact scenario from issue #12:
+        session.add(Model(title="...")) without setting id.
+        """
+        port = dev_server
+        response = requests.get(
+            f"http://localhost:{port}/autoincrement-insert-sqlalchemy"
+        )
+
+        assert response.status_code == 200, (
+            f"ORM autoincrement failed: {response.json()}"
+        )
+        data = response.json()
+
+        assert data["test"] == "autoincrement_insert_sqlalchemy"
+        assert data["success"] is True, (
+            f"ORM autoincrement failed: entry_id={data.get('entry_id')}, "
+            f"entry2_id={data.get('entry2_id')}, "
+            f"error={data.get('error')}"
+        )
+        assert data["entry_id"] == 1
+        assert data["entry2_id"] == 2
+
+    def test_inserted_primary_key_via_sqlalchemy_core(self, dev_server):
+        """Test result.inserted_primary_key returns auto-generated ID."""
+        port = dev_server
+        response = requests.get(f"http://localhost:{port}/autoincrement-lastrowid")
+
+        assert response.status_code == 200, (
+            f"inserted_primary_key failed: {response.json()}"
+        )
+        data = response.json()
+
+        assert data["test"] == "autoincrement_lastrowid"
+        assert data["success"] is True, (
+            f"inserted_primary_key failed: "
+            f"lastrowid_1={data.get('lastrowid_1')}, "
+            f"lastrowid_2={data.get('lastrowid_2')}, "
+            f"error={data.get('error')}"
+        )
+        assert data["lastrowid_1"] == 1
+        assert data["lastrowid_2"] == 2
+
+
+# MARK: - DateTime Column Tests (Issue #13)
+
+
+class TestWorkerDateTimeColumn:
+    """Test DateTime column handling via Worker endpoints.
+
+    These tests mirror the TestDateTimeColumn tests in test_restapi_integration.py.
+    """
+
+    def test_datetime_insert_and_retrieve(self, dev_server):
+        """Test DateTime column insert and retrieve with timezone-aware datetimes."""
+        port = dev_server
+        response = requests.get(f"http://localhost:{port}/datetime-basic")
+
+        assert response.status_code == 200, f"datetime_basic failed: {response.json()}"
+        data = response.json()
+
+        assert data["test"] == "datetime_basic"
+        assert data["success"] is True, (
+            f"datetime_basic failed: error={data.get('error')}"
+        )
+        assert data["title"] == "Test"
+        assert data["created_at_type"] == "datetime"
+
+    def test_datetime_with_non_utc_timezone(self, dev_server):
+        """Test DateTime with non-UTC timezone offset (exact scenario from issue)."""
+        port = dev_server
+        response = requests.get(f"http://localhost:{port}/datetime-non-utc")
+
+        assert response.status_code == 200, (
+            f"datetime_non_utc failed: {response.json()}"
+        )
+        data = response.json()
+
+        assert data["test"] == "datetime_non_utc"
+        assert data["success"] is True, (
+            f"datetime_non_utc failed: error={data.get('error')}"
+        )
+        assert data["origin_type"] == "datetime"
+        assert data["indexed_type"] == "datetime"
+
+    def test_datetime_nullable(self, dev_server):
+        """Test nullable DateTime columns handle NULL correctly."""
+        port = dev_server
+        response = requests.get(f"http://localhost:{port}/datetime-nullable")
+
+        assert response.status_code == 200, (
+            f"datetime_nullable failed: {response.json()}"
+        )
+        data = response.json()
+
+        assert data["test"] == "datetime_nullable"
+        assert data["success"] is True, (
+            f"datetime_nullable failed: error={data.get('error')}"
+        )
+        assert data["published_has_datetime"] is True
+        assert data["draft_is_none"] is True
+
+    def test_datetime_orm_session(self, dev_server):
+        """Test DateTime via ORM session (reproduces exact issue #13 scenario)."""
+        port = dev_server
+        response = requests.get(f"http://localhost:{port}/datetime-orm")
+
+        assert response.status_code == 200, f"datetime_orm failed: {response.json()}"
+        data = response.json()
+
+        assert data["test"] == "datetime_orm"
+        assert data["success"] is True, (
+            f"datetime_orm failed: error={data.get('error')}"
+        )
+        assert data["entry_id"] == 1
+        assert data["entry_title"] == "Issue 13 DateTime Test"
+        assert data["origin_is_datetime"] is True
+        assert data["indexed_is_datetime"] is True
+        assert data["inserted_is_datetime"] is True
